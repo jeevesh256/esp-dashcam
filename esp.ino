@@ -106,15 +106,15 @@ void rotateVideoFile() {
   currentVideoFile = SD_MMC.open(filename.c_str(), FILE_WRITE);
   
   if (currentVideoFile) {
-    // Write MJPEG header
+    // Write MJPEG header with proper content type and boundary
     currentVideoFile.print("--video\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n");
     Serial.printf("Started new video file: %s\n", filename.c_str());
+    lastFileTime = millis();  // Update timestamp after successful file creation
   } else {
     Serial.println("Failed to create new video file!");
   }
   
   fileCounter++;
-  lastFileTime = millis();
 }
 
 void handleStream() {
@@ -125,41 +125,51 @@ void handleStream() {
   }
   
   String response = "HTTP/1.1 200 OK\r\n";
-  response += "Access-Control-Allow-Origin: *\r\n";  // Add CORS header
+  response += "Access-Control-Allow-Origin: *\r\n";
   response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
   client.print(response);
 
+  unsigned long frameStart;
+  const int frameDelay = 100; // 10 FPS
+
   while (client.connected()) {
-    unsigned long currentTime = millis();
+    frameStart = millis();
     
     // Check if we need to rotate the file (every 60 seconds)
-    if (currentTime - lastFileTime >= 60000) {
+    if (currentVideoFile && (millis() - lastFileTime >= 60000)) {
       rotateVideoFile();
     }
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
       Serial.println("Camera capture failed");
-      delay(100);
+      delay(10);
       continue;
     }
 
+    // Send frame to client
     client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
     client.write(fb->buf, fb->len);
     client.print("\r\n");
 
-    // Save frame to current video file with proper MJPEG format
+    // Save frame to current video file
     if (currentVideoFile) {
-      currentVideoFile.printf("\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+      currentVideoFile.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
       currentVideoFile.write(fb->buf, fb->len);
+      currentVideoFile.print("\r\n");
+      currentVideoFile.flush();  // Ensure frame is written to disk
     }
 
     esp_camera_fb_return(fb);
-    delay(100);
+
+    // Maintain consistent frame rate
+    int processingTime = millis() - frameStart;
+    if (processingTime < frameDelay) {
+      delay(frameDelay - processingTime);
+    }
   }
 
-  // If client disconnects, complete current file
-  completeVideoFile();
+  completeVideoFile();  // Properly close current file when stream ends
 }
 
 void handleDownload(AsyncWebServerRequest *request) {
@@ -231,79 +241,349 @@ void setup() {
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>ESP32-CAM Stream</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32-CAM Dashboard</title>
   <style>
-    body { font-family: sans-serif; background: #f4f4f4; text-align: center; padding: 10px; }
-    #stream { width: 320px; border-radius: 10px; margin: 15px auto; box-shadow: 0 0 8px rgba(0,0,0,0.2); }
-    .stream-error { border: 2px solid red; }
-    table { width: 100%; max-width: 600px; margin: auto; background: white; border-collapse: collapse; border-radius: 6px; overflow: hidden; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-    th, td { padding: 10px; border-bottom: 1px solid #eee; }
-    td a { text-decoration: none; color: #007bff; }
-    .btn { padding: 6px 12px; margin: 2px; border: none; border-radius: 4px; cursor: pointer; }
-    .download { background-color: #28a745; color: white; }
-    .delete { background-color: #dc3545; color: white; }
-    .status-connected { color: green; }
-    .status-connecting { color: orange; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --primary-color: #2196F3;
+      --danger-color: #f44336;
+      --success-color: #4CAF50;
+      --warning-color: #ff9800;
+      --border-radius: 8px;
+      --shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    body { 
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f5;
+      color: #333;
+      line-height: 1.6;
+    }
+    .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+    header {
+      background: white;
+      padding: 1.5rem;
+      box-shadow: var(--shadow);
+      border-radius: var(--border-radius);
+      margin-bottom: 2rem;
+    }
+    h1 { 
+      color: var(--primary-color); 
+      text-align: center;
+      font-size: 2rem;
+      font-weight: 500;
+    }
+
+    /* Navigation */
+    .nav-tabs {
+      display: flex;
+      background: white;
+      padding: 0.5rem;
+      border-radius: var(--border-radius);
+      box-shadow: var(--shadow);
+      margin-bottom: 2rem;
+    }
+    .nav-tab {
+      flex: 1;
+      padding: 1rem;
+      text-align: center;
+      border: none;
+      background: transparent;
+      color: #666;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: all 0.3s;
+      border-radius: var(--border-radius);
+    }
+    .nav-tab.active {
+      background: var(--primary-color);
+      color: white;
+    }
+    .nav-tab:hover:not(.active) {
+      background: #f0f0f0;
+    }
+
+    /* Content Panels */
+    .panel {
+      display: none;
+      background: white;
+      border-radius: var(--border-radius);
+      box-shadow: var(--shadow);
+    }
+    .panel.active { display: block; }
+
+    /* Stream Panel */
+    #stream-panel.panel.active {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+    }
+
+    /* Files Panel */
+    #files-panel {
+      display: none;
+      height: auto;
+    }
+    #files-panel.active {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .storage-info {
+      padding: 1rem;
+      background: white;
+      border-bottom: 1px solid #eee;
+    }
+
+    .storage-bar {
+      width: 100%;
+      height: 24px;
+      background: #e9ecef;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 0.5rem 0;
+    }
+
+    .storage-progress {
+      height: 100%;
+      background: var(--success-color);
+      color: white;
+      text-align: center;
+      line-height: 24px;
+      transition: width 0.3s ease;
+    }
+
+    .file-manager {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .file-header {
+      background: #f8f9fa;
+      padding: 1rem;
+      border-bottom: 1px solid #dee2e6;
+      display: grid;
+      grid-template-columns: minmax(200px, 1fr) 120px 100px;
+      font-weight: 500;
+      color: #495057;
+    }
+
+    .files-list {
+      flex: 1;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: #90A4AE #CFD8DC;
+    }
+
+    .files-list::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .files-list::-webkit-scrollbar-track {
+      background: #f1f1f1;
+      border-radius: 4px;
+    }
+
+    .files-list::-webkit-scrollbar-thumb {
+      background: #90A4AE;
+      border-radius: 4px;
+    }
+
+    .files-list::-webkit-scrollbar-thumb:hover {
+      background: #78909C;
+    }
+
+    .file-item {
+      display: grid;
+      grid-template-columns: minmax(200px, 1fr) 120px 100px;
+      padding: 0.75rem 1rem;
+      align-items: center;
+      border-bottom: 1px solid #eee;
+      transition: background-color 0.2s;
+    }
+
+    .file-item:hover {
+      background-color: #f8f9fa;
+    }
+
+    .file-name {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .file-icon {
+      color: var(--primary-color);
+      font-size: 1.2rem;
+    }
+
+    .file-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .btn {
+      padding: 0.4rem 0.8rem;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: opacity 0.2s;
+      text-decoration: none;
+      text-align: center;
+    }
+
+    .btn-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.25rem;
+      padding: 0.6rem 1rem;
+      font-size: 1.1rem;
+    }
+
+    .storage-info {
+      margin-bottom: 1rem;
+      padding: 1rem;
+      background: white;
+      border-radius: var(--border-radius);
+      box-shadow: var(--shadow);
+    }
   </style>
 </head>
 <body>
-  <h2>ESP32-CAM Stream</h2>
-  <div id="stream-container">
-    <img id="stream" alt="Loading stream..." onerror="handleStreamError(this)"/>
-  </div>
-  <div id="stream-status" class="status-connecting">Connecting to stream...</div>
-  
-  <div id="storage-info" style="margin: 15px auto; max-width: 600px;">
-    <div style="background: #eee; border-radius: 4px; padding: 2px; margin: 10px 0;">
-      <div id="storage-bar" style="background: #4CAF50; height: 20px; border-radius: 3px; width: 0%; transition: width 0.3s ease;">
-        <span style="color: white; font-size: 12px; line-height: 20px;"></span>
+  <div class="container">
+    <header>
+      <h1>ESP32-CAM Dashboard</h1>
+    </header>
+
+    <div class="nav-tabs">
+      <button class="nav-tab active" onclick="showPanel('stream-panel')">Live Stream</button>
+      <button class="nav-tab" onclick="showPanel('files-panel')">File Manager</button>
+    </div>
+
+    <div id="stream-panel" class="panel active">
+      <div class="stream-container">
+        <div class="stream-wrapper">
+          <img id="stream" class="stream-video" alt="Loading stream...">
+        </div>
+        <div id="stream-status" class="stream-status">
+          <span class="status-icon">⌛</span>
+          <span class="status-text">Initializing stream...</span>
+        </div>
       </div>
     </div>
-    <div id="storage-text" style="font-size: 14px; color: #666;"></div>
+
+    <div id="files-panel" class="panel">
+      <div class="storage-info">
+        <div class="storage-bar">
+          <div id="storage-progress" class="storage-progress"></div>
+        </div>
+        <div id="storage-text" class="storage-text"></div>
+      </div>
+      <div class="file-manager">
+        <div class="file-header">
+          <div>Name</div>
+          <div>Size</div>
+          <div>Actions</div>
+        </div>
+        <div id="files-list" class="files-list"></div>
+      </div>
+    </div>
   </div>
-  
-  <h3>Recorded Files</h3>
-  <table id="fileTable"><thead><tr><th>File</th><th>Actions</th></tr></thead><tbody></tbody></table>
 
   <script>
+    function showPanel(panelId) {
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
+      document.getElementById(panelId).classList.add('active');
+      event.currentTarget.classList.add('active');
+
+      if (panelId === 'stream-panel') {
+        initStream();
+      } else {
+        // Stop and remove stream when switching to file manager
+        const streamImg = document.getElementById('stream');
+        const status = document.getElementById('stream-status');
+        streamImg.removeAttribute('src');
+        streamImg.style.display = 'none';
+        status.style.display = 'none';
+      }
+    }
+
     function initStream() {
       const img = document.getElementById('stream');
       const status = document.getElementById('stream-status');
       const ip = window.location.hostname;
-      img.src = `http://${ip}:81/stream`;
-      status.textContent = 'Connecting to stream...';
-      status.className = 'status-connecting';
       
-      img.onload = function() {
-        status.textContent = 'Stream Connected';
-        status.className = 'status-connected';
-      }
+      // Show stream elements
+      img.style.display = 'block';
+      status.style.display = 'inline-flex';
+      
+      status.className = 'stream-status';
+      status.style.background = 'var(--warning-color)';
+      status.style.color = 'white';
+      status.innerHTML = '<span class="status-icon">⌛</span><span class="status-text">Connecting to stream...</span>';
+      
+      img.src = `http://${ip}:81/stream`;
+      
+      img.onload = () => {
+        status.style.background = 'var(--success-color)';
+        status.innerHTML = '<span class="status-icon">✅</span><span class="status-text">Stream Connected</span>';
+      };
+      
+      img.onerror = () => {
+        status.style.background = 'var(--danger-color)';
+        status.innerHTML = '<span class="status-icon">⚠️</span><span class="status-text">Stream Disconnected</span>';
+      };
     }
 
-    function handleStreamError(img) {
-      const status = document.getElementById('stream-status');
-      img.classList.add('stream-error');
-      status.textContent = 'Stream connection lost. Retrying...';
-      status.className = 'status-connecting';
-      setTimeout(() => {
-        img.src = img.src.split('?')[0] + '?' + new Date().getTime();
-        img.classList.remove('stream-error');
-      }, 1000);
+    function formatFileSize(size) {
+      if (size < 1024) return size + ' B';
+      if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB';
+      return (size / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function getFileIcon(filename) {
+      const ext = filename.split('.').pop().toLowerCase();
+      const icons = {
+        'mjpeg': '📹', // Video files
+        'jpg': '🖼️',   // Image files
+        'jpeg': '🖼️',  // Image files
+        'txt': '📄',   // Text files
+        'log': '📝',   // Log files
+        'json': '📋',  // Data files
+        'csv': '📊',   // Spreadsheet files
+        'avi': '🎥',   // Video files
+        'default': '📁' // Default icon
+      };
+      return icons[ext] || icons.default;
     }
 
     function fetchFiles() {
       fetch("/list.json").then(res => res.json()).then(files => {
-        const table = document.querySelector("#fileTable tbody");
-        table.innerHTML = "";
+        const list = document.getElementById("files-list");
+        list.innerHTML = "";
         files.forEach(file => {
-          const row = document.createElement("tr");
-          row.innerHTML = `
-            <td>${file}</td>
-            <td>
-              <a href="/download?file=${file}" class="btn download" download>Download</a>
-              <button class="btn delete" onclick="deleteFile('${file}')">Delete</button>
-            </td>`;
-          table.appendChild(row);
+          const item = document.createElement("div");
+          item.className = "file-item";
+          item.innerHTML = `
+            <div class="file-name">
+              <span class="file-icon">${getFileIcon(file.name)}</span>
+              ${file.name}
+            </div>
+            <div class="file-size">${formatFileSize(file.size)}</div>
+            <div class="file-actions">
+              <a href="/download?file=${file.name}" class="btn btn-primary btn-icon" download>
+                <span>⬇️</span>
+              </a>
+              <button class="btn btn-danger btn-icon" onclick="deleteFile('${file.name}')">
+                <span>❌</span>
+              </button>
+            </div>`;
+          list.appendChild(item);
         });
       });
     }
@@ -311,26 +591,33 @@ void setup() {
     function deleteFile(filename) {
       if (!confirm(`Delete ${filename}?`)) return;
       fetch(`/delete?file=${filename}`).then(res => res.text()).then(msg => {
-        alert(msg); fetchFiles();
+        alert(msg);
+        fetchFiles();
+        updateStorageInfo();
       });
     }
 
     function updateStorageInfo() {
       fetch("/storage").then(res => res.json()).then(info => {
-        const bar = document.getElementById('storage-bar');
+        const progress = document.getElementById('storage-progress');
         const text = document.getElementById('storage-text');
-        bar.style.width = info.percent + '%';
-        bar.style.background = info.percent > 90 ? '#f44336' : '#4CAF50';
-        bar.children[0].textContent = info.percent + '%';
+        progress.style.width = info.percent + '%';
+        progress.style.background = info.percent > 90 ? 'var(--danger-color)' : 'var(--success-color)';
+        progress.textContent = info.percent + '%';
         text.textContent = `Storage: ${info.used}MB used of ${info.total}MB (${info.free}MB free)`;
       });
     }
 
-    initStream();
-    setInterval(fetchFiles, 10000);
+    // Remove stream initialization from page load
     fetchFiles();
-    setInterval(updateStorageInfo, 30000); // Update every 30 seconds
     updateStorageInfo();
+    setInterval(fetchFiles, 10000);
+    setInterval(updateStorageInfo, 30000);
+
+    // Initialize stream if we start on stream panel
+    if (document.getElementById('stream-panel').classList.contains('active')) {
+      initStream();
+    }
   </script>
 </body>
 </html>
@@ -345,7 +632,9 @@ void setup() {
     while (file) {
       if (!file.isDirectory()) {
         if (!first) json += ",";
-        json += "\"" + String(file.name()) + "\"";
+        // Add file size to the JSON response
+        json += "{\"name\":\"" + String(file.name()) + 
+                "\",\"size\":" + String(file.size()) + "}";
         first = false;
       }
       file = root.openNextFile();
