@@ -10,6 +10,7 @@
 #include "driver/rtc_io.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"
 
 // Camera pin configuration for AI Thinker
 #define PWDN_GPIO_NUM     32
@@ -46,44 +47,105 @@ struct StorageInfo {
   int usagePercent;
 };
 
+#define MONITOR_INTERVAL 5000     // Check system every 5 seconds
+#define MIN_HEAP_SIZE 40000       // Minimum heap before recovery
+#define MIN_FREE_HEAP 30000       // Minimum free heap for operation
+#define MAX_RETRY_COUNT 3         // Max retries before restart
+#define RECOVERY_DELAY 1000       // Delay between recovery attempts
+#define FREE_SPACE_MIN 5242880    // 5MB minimum free space
+#define VIDEO_DURATION 60000     // 60 seconds
+#define FRAME_RATE 15            // 15fps constant
+#define FRAME_INTERVAL 66666     // Microseconds (1000000/15 for 15fps)
+#define FRAMES_PER_VIDEO 900     // Total frames for 1 minute (15fps * 60s)
+#define WRITE_BUFFER_SIZE 512    // Smaller write buffer
+#define FRAME_BUFFER_SIZE 8192   // Smaller frame buffer
+#define STACK_SIZE 4096          // Reduced stack size
+#define WDT_TIMEOUT 60           // 1 minute watchdog
+
+// Core assignments
+#define RECORDING_CORE 0
+#define STREAM_CORE 1
+
+// Add timing control variables
+unsigned long videoStartTime = 0;
+unsigned long nextFrameTime = 0;
+unsigned long frameCount = 0;
+
+// Task handle for continuous recording
+TaskHandle_t recordingTaskHandle = NULL;
+
+// Add global variables at the top with other globals
+unsigned long recordingStartTime = 0;
+unsigned long lastFrameTime = 0;
+unsigned long framesInCurrentFile = 0;
+unsigned long frameCounter = 0;
+bool isRecording = false;
+bool isFirstFile = true;
+
+// Add monitoring variables
+unsigned long lastMonitorCheck = 0;
+unsigned long lastFrameSuccess = 0;
+unsigned long failedWrites = 0;
+bool systemHealthy = false;
+
+// Add recording status tracking
+bool isFirstBoot = true;
+bool recordingStarted = false;
+
+static uint8_t* writeBuffer = NULL;
+static size_t writeBufferSize = 0;
+
+void initMemory() {
+    if (writeBuffer) free(writeBuffer);
+    writeBufferSize = WRITE_BUFFER_SIZE;
+    writeBuffer = (uint8_t*)malloc(writeBufferSize);
+    if (!writeBuffer) {
+        Serial.println("Failed to allocate write buffer");
+        ESP.restart();
+    }
+}
+
 void startCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 10000000; // Lower clock speed
+    config.pixel_format = PIXFORMAT_JPEG;
 
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_VGA;  // Reduced from SVGA
-    config.jpeg_quality = 15;  // Reduced quality
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_QVGA;  // Even smaller for non-PSRAM
-    config.jpeg_quality = 20;
-    config.fb_count = 1;
-  }
-
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
-  }
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 20;        // Lower quality
+    config.fb_count = 1;            // Single buffer
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed: %d\n", err);
+        ESP.restart();
+    }
+    
+    sensor_t* s = esp_camera_sensor_get();
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, 20);
+    s->set_brightness(s, 0);
+    s->set_saturation(s, -2);    // Reduce color data
+    s->set_contrast(s, -2);      // Reduce contrast
 }
 
 String getCurrentFileName() {
@@ -100,76 +162,187 @@ void completeVideoFile() {
 }
 
 void rotateVideoFile() {
-  completeVideoFile();  // Complete current file before rotating
-  
-  String filename = String("/Dashcam_") + String(fileCounter) + ".mjpeg";
+  if (currentVideoFile) {
+    currentVideoFile.print("\r\n--video--\r\n");
+    currentVideoFile.close();
+    Serial.printf("Completed video file %d, duration: %lu ms\n", 
+                 fileCounter, millis() - videoStartTime);
+  }
+
+  if (SD_MMC.totalBytes() - SD_MMC.usedBytes() < FREE_SPACE_MIN) {
+    deleteOldestFile();
+  }
+
+  String filename = getCurrentFileName();
   currentVideoFile = SD_MMC.open(filename.c_str(), FILE_WRITE);
   
   if (currentVideoFile) {
-    // Write MJPEG header with proper content type and boundary
     currentVideoFile.print("--video\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n");
     Serial.printf("Started new video file: %s\n", filename.c_str());
-    lastFileTime = millis();  // Update timestamp after successful file creation
+    videoStartTime = millis();
+    frameCounter = 0;
+    fileCounter++;
   } else {
-    Serial.println("Failed to create new video file!");
+    Serial.println("Failed to create new file!");
   }
-  
-  fileCounter++;
 }
 
-void handleStream() {
-  WiFiClient client = syncServer.client();
-  
-  if (!client.connected()) {
-    return;
+void deleteOldestFile() {
+  File root = SD_MMC.open("/");
+  if (!root || !root.isDirectory()) return;
+
+  String oldestFile;
+  unsigned long oldestNum = ULONG_MAX;
+
+  File file = root.openNextFile();
+  while (file) {
+    String fname = String(file.name());
+    if (fname.startsWith("/Dashcam_") && fname.endsWith(".mjpeg")) {
+      unsigned long num = fname.substring(9, fname.length() - 6).toInt();
+      if (num < oldestNum) {
+        oldestNum = num;
+        oldestFile = fname;
+      }
+    }
+    file = root.openNextFile();
   }
-  
-  String response = "HTTP/1.1 200 OK\r\n";
-  response += "Access-Control-Allow-Origin: *\r\n";
-  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
-  client.print(response);
 
-  unsigned long frameStart;
-  const int frameDelay = 100; // 10 FPS
+  if (oldestFile.length() > 0) {
+    SD_MMC.remove(oldestFile);
+    Serial.printf("Deleted oldest file: %s\n", oldestFile.c_str());
+  }
+}
 
-  while (client.connected()) {
-    frameStart = millis();
+// Update minSize function to handle size_t properly
+inline size_t minSize(size_t a, size_t b) {
+    return (a < b) ? a : b;
+}
+
+void monitorSystem() {
+    unsigned long now = millis();
+    if (now - lastMonitorCheck >= MONITOR_INTERVAL) {
+        lastMonitorCheck = now;
+        
+        // Check heap
+        if (ESP.getFreeHeap() < MIN_HEAP_SIZE) {
+            Serial.println("Low memory, recovering...");
+            completeVideoFile();
+            ESP.restart();
+        }
+        
+        // Check recording status
+        if (now - lastFrameSuccess > 10000) {  // No frames for 10 seconds
+            Serial.println("Recording stalled, recovering...");
+            restartRecording();
+        }
+        
+        // Check file system
+        if (!currentVideoFile || failedWrites > 10) {
+            Serial.println("File system issues, recovering...");
+            restartRecording();
+        }
+        
+        systemHealthy = true;
+    }
+}
+
+void restartRecording() {
+    completeVideoFile();
+    delay(100);
+    rotateVideoFile();
+    failedWrites = 0;
+    videoStartTime = millis();
+    frameCount = 0;
+}
+
+void startRecording() {
+    if (!recordingStarted) {
+        videoStartTime = millis();
+        frameCount = 0;
+        rotateVideoFile();
+        recordingStarted = true;
+        isFirstBoot = false;
+        Serial.println("Recording started automatically");
+    }
+}
+
+void recordingTask(void* parameter) {
+    esp_task_wdt_init(WDT_TIMEOUT, true);
+    esp_task_wdt_add(NULL);
     
-    // Check if we need to rotate the file (every 60 seconds)
-    if (currentVideoFile && (millis() - lastFileTime >= 60000)) {
-      rotateVideoFile();
+    size_t frameErrors = 0;
+    unsigned long videoStartUs = micros();
+    unsigned long nextFrameUs = videoStartUs;
+    
+    while(true) {
+        unsigned long frameStartUs = micros();
+        
+        // Check if it's time for next frame
+        if (frameStartUs < nextFrameUs) {
+            delayMicroseconds(nextFrameUs - frameStartUs);
+            continue;
+        }
+        
+        if (!currentVideoFile || !recordingStarted) {
+            startRecording();
+            videoStartUs = micros();
+            nextFrameUs = videoStartUs;
+            esp_task_wdt_reset();
+            continue;
+        }
+
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            if (++frameErrors > 5) {
+                ESP.restart();
+            }
+            nextFrameUs = micros() + FRAME_INTERVAL;
+            continue;
+        }
+        frameErrors = 0;
+
+        if (currentVideoFile && writeBuffer) {
+            bool writeOK = true;
+            
+            // Write frame with timestamp
+            currentVideoFile.printf("--frame\r\nContent-Type: image/jpeg\r\nX-Timestamp: %lu\r\nContent-Length: %u\r\n\r\n", 
+                                  (micros() - videoStartUs), fb->len);
+            
+            // Write frame data
+            size_t pos = 0;
+            while (pos < fb->len && writeOK) {
+                size_t toWrite = minSize(writeBufferSize, fb->len - pos);
+                if (currentVideoFile.write(fb->buf + pos, toWrite) != toWrite) {
+                    writeOK = false;
+                    break;
+                }
+                pos += toWrite;
+                if (pos % (writeBufferSize * 4) == 0) {
+                    esp_task_wdt_reset();
+                }
+            }
+            
+            if (writeOK) {
+                currentVideoFile.print("\r\n");
+                frameCount++;
+                lastFrameSuccess = millis();
+                
+                // Rotate file after exactly FRAMES_PER_VIDEO frames
+                if (frameCount >= FRAMES_PER_VIDEO) {
+                    completeVideoFile();
+                    rotateVideoFile();
+                    videoStartUs = micros();
+                    frameCount = 0;
+                }
+            }
+        }
+
+        esp_camera_fb_return(fb);
+        
+        // Calculate next frame time
+        nextFrameUs = videoStartUs + (frameCount + 1) * FRAME_INTERVAL;
+        esp_task_wdt_reset();
     }
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Camera capture failed");
-      delay(10);
-      continue;
-    }
-
-    // Send frame to client
-    client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-    client.write(fb->buf, fb->len);
-    client.print("\r\n");
-
-    // Save frame to current video file
-    if (currentVideoFile) {
-      currentVideoFile.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-      currentVideoFile.write(fb->buf, fb->len);
-      currentVideoFile.print("\r\n");
-      currentVideoFile.flush();  // Ensure frame is written to disk
-    }
-
-    esp_camera_fb_return(fb);
-
-    // Maintain consistent frame rate
-    int processingTime = millis() - frameStart;
-    if (processingTime < frameDelay) {
-      delay(frameDelay - processingTime);
-    }
-  }
-
-  completeVideoFile();  // Properly close current file when stream ends
 }
 
 void handleDownload(AsyncWebServerRequest *request) {
@@ -181,22 +354,19 @@ void handleDownload(AsyncWebServerRequest *request) {
   String filename = request->getParam("file")->value();
   if (!filename.startsWith("/")) filename = "/" + filename;
 
-  fs::File file = SD_MMC.open(filename);
+  fs::File file = SD_MMC.open(filename, "r");
   if (!file || file.isDirectory()) {
-    request->send(404, "text/plain", "File not found or is a directory");
+    request->send(404);
     return;
   }
 
-  size_t fileSize = file.size();
-  AsyncWebServerResponse *response = request->beginResponse("application/octet-stream", fileSize,
-    [file](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
-      size_t bytesRead = file.read(buffer, maxLen);
-      vTaskDelay(1);
-      return bytesRead;
-    });
-
-  response->addHeader("Content-Disposition", "attachment; filename=\"" + filename.substring(filename.lastIndexOf("/") + 1) + "\"");
-  response->addHeader("Content-Length", String(fileSize));
+  AsyncWebServerResponse *response = request->beginResponse("application/octet-stream", 
+    file.size(), [file](uint8_t *buffer, size_t maxLen, size_t index) mutable -> size_t {
+      return file.read(buffer, maxLen);
+  });
+  
+  response->addHeader("Content-Disposition", "attachment; filename=" + 
+                     filename.substring(filename.lastIndexOf("/") + 1));
   request->send(response);
 }
 
@@ -207,6 +377,12 @@ StorageInfo getStorageInfo() {
   info.freeBytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
   info.usagePercent = (int)((info.usedBytes * 100) / info.totalBytes);
   return info;
+}
+
+void onAllocError(size_t requested, size_t available, const char* hint) {
+    Serial.printf("Memory allocation failed - requested: %u, available: %u\n", requested, available);
+    completeVideoFile();
+    ESP.restart();
 }
 
 void setup() {
@@ -230,10 +406,22 @@ void setup() {
   }
 
   startCamera();
-
-  // Start first video file
-  rotateVideoFile();
-
+  initMemory();
+  
+  // Start recording task with higher priority
+  xTaskCreatePinnedToCore(
+    recordingTask,
+    "Record",
+    STACK_SIZE,
+    NULL,
+    2,  // Higher priority for recording
+    &recordingTaskHandle,
+    RECORDING_CORE
+  );
+  
+  // Ensure recording starts immediately
+  startRecording();
+  
   // Serve UI
   asyncServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send(200, "text/html", R"rawliteral(
@@ -242,7 +430,7 @@ void setup() {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32-CAM Dashboard</title>
+  <title>ESP32-CAM File Manager</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
@@ -456,90 +644,27 @@ void setup() {
 <body>
   <div class="container">
     <header>
-      <h1>ESP32-CAM Dashboard</h1>
+      <h1>ESP32-CAM File Manager</h1>
     </header>
 
-    <div class="nav-tabs">
-      <button class="nav-tab active" onclick="showPanel('stream-panel')">Live Stream</button>
-      <button class="nav-tab" onclick="showPanel('files-panel')">File Manager</button>
+    <div class="storage-info">
+      <div class="storage-bar">
+        <div id="storage-progress" class="storage-progress"></div>
+      </div>
+      <div id="storage-text" class="storage-text"></div>
     </div>
 
-    <div id="stream-panel" class="panel active">
-      <div class="stream-container">
-        <div class="stream-wrapper">
-          <img id="stream" class="stream-video" alt="Loading stream...">
-        </div>
-        <div id="stream-status" class="stream-status">
-          <span class="status-icon">⌛</span>
-          <span class="status-text">Initializing stream...</span>
-        </div>
+    <div class="file-manager">
+      <div class="file-header">
+        <div>Name</div>
+        <div>Size</div>
+        <div>Actions</div>
       </div>
-    </div>
-
-    <div id="files-panel" class="panel">
-      <div class="storage-info">
-        <div class="storage-bar">
-          <div id="storage-progress" class="storage-progress"></div>
-        </div>
-        <div id="storage-text" class="storage-text"></div>
-      </div>
-      <div class="file-manager">
-        <div class="file-header">
-          <div>Name</div>
-          <div>Size</div>
-          <div>Actions</div>
-        </div>
-        <div id="files-list" class="files-list"></div>
-      </div>
+      <div id="files-list" class="files-list"></div>
     </div>
   </div>
 
   <script>
-    function showPanel(panelId) {
-      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
-      document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
-      document.getElementById(panelId).classList.add('active');
-      event.currentTarget.classList.add('active');
-
-      if (panelId === 'stream-panel') {
-        initStream();
-      } else {
-        // Stop and remove stream when switching to file manager
-        const streamImg = document.getElementById('stream');
-        const status = document.getElementById('stream-status');
-        streamImg.removeAttribute('src');
-        streamImg.style.display = 'none';
-        status.style.display = 'none';
-      }
-    }
-
-    function initStream() {
-      const img = document.getElementById('stream');
-      const status = document.getElementById('stream-status');
-      const ip = window.location.hostname;
-      
-      // Show stream elements
-      img.style.display = 'block';
-      status.style.display = 'inline-flex';
-      
-      status.className = 'stream-status';
-      status.style.background = 'var(--warning-color)';
-      status.style.color = 'white';
-      status.innerHTML = '<span class="status-icon">⌛</span><span class="status-text">Connecting to stream...</span>';
-      
-      img.src = `http://${ip}:81/stream`;
-      
-      img.onload = () => {
-        status.style.background = 'var(--success-color)';
-        status.innerHTML = '<span class="status-icon">✅</span><span class="status-text">Stream Connected</span>';
-      };
-      
-      img.onerror = () => {
-        status.style.background = 'var(--danger-color)';
-        status.innerHTML = '<span class="status-icon">⚠️</span><span class="status-text">Stream Disconnected</span>';
-      };
-    }
-
     function formatFileSize(size) {
       if (size < 1024) return size + ' B';
       if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB';
@@ -608,22 +733,18 @@ void setup() {
       });
     }
 
-    // Remove stream initialization from page load
+    // Initialize
     fetchFiles();
     updateStorageInfo();
     setInterval(fetchFiles, 10000);
     setInterval(updateStorageInfo, 30000);
-
-    // Initialize stream if we start on stream panel
-    if (document.getElementById('stream-panel').classList.contains('active')) {
-      initStream();
-    }
   </script>
 </body>
 </html>
 )rawliteral");
   });
 
+  // Keep other routes
   asyncServer.on("/list.json", HTTP_GET, [](AsyncWebServerRequest *request) {
     File root = SD_MMC.open("/");
     File file = root.openNextFile();
@@ -669,11 +790,18 @@ void setup() {
   });
 
   asyncServer.begin();
-
-  syncServer.on("/stream", handleStream);
-  syncServer.begin();
+  
+  // Remove sync server for streaming
+  // Start recording immediately
+  startRecording();
 }
 
 void loop() {
-  syncServer.handleClient();
+  // Check recording status
+  if (!recordingStarted) {
+    startRecording();
+  }
+  
+  esp_task_wdt_reset();
+  vTaskDelay(pdMS_TO_TICKS(100));
 }
