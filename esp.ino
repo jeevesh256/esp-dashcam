@@ -148,25 +148,197 @@ void startCamera() {
     s->set_contrast(s, -2);      // Reduce contrast
 }
 
+// Add AVI header structures
+struct AviMainHeader {
+  uint32_t microSecPerFrame;
+  uint32_t maxBytesPerSec;
+  uint32_t paddingGranularity;
+  uint32_t flags;
+  uint32_t totalFrames;
+  uint32_t initialFrames;
+  uint32_t streams;
+  uint32_t suggestedBufferSize;
+  uint32_t width;
+  uint32_t height;
+  uint32_t reserved[4];
+} __attribute__((packed));
+
+struct AviStreamHeader {
+  char fccType[4];
+  char fccHandler[4];
+  uint32_t flags;
+  uint16_t priority;
+  uint16_t language;
+  uint32_t initialFrames;
+  uint32_t scale;
+  uint32_t rate;
+  uint32_t start;
+  uint32_t length;
+  uint32_t suggestedBufferSize;
+  uint32_t quality;
+  uint32_t sampleSize;
+  struct {
+    uint16_t left;
+    uint16_t top;
+    uint16_t right;
+    uint16_t bottom;
+  } frame;
+} __attribute__((packed));
+
+struct BitmapInfoHeader {
+  uint32_t size;
+  uint32_t width;
+  uint32_t height;
+  uint16_t planes;
+  uint16_t bitCount;
+  uint32_t compression;
+  uint32_t sizeImage;
+  uint32_t xPelsPerMeter;
+  uint32_t yPelsPerMeter;
+  uint32_t clrUsed;
+  uint32_t clrImportant;
+} __attribute__((packed));
+
+struct ChunkHeader {
+  char id[4];
+  uint32_t size;
+} __attribute__((packed));
+
+// Global variables for AVI
+uint32_t currentFileFrames = 0;
+uint32_t totalDataSize = 0;
+uint32_t moviListPos = 0;
+
 String getCurrentFileName() {
-  return String("/Dashcam_") + String(fileCounter) + ".mjpeg";
+  return String("/Dashcam_") + String(fileCounter) + ".avi";
 }
 
-// Add file completion message
-void completeVideoFile() {
-  if (currentVideoFile) {
-    currentVideoFile.print("\r\n--video--\r\n");  // End MJPEG marker
-    currentVideoFile.close();
-    Serial.printf("Completed video file: video_%d.mjpeg\n", fileCounter-1);
-  }
+void writeAviHeader() {
+  if (!currentVideoFile) return;
+  
+  currentVideoFile.seek(0);
+  
+  // RIFF header
+  ChunkHeader riffHeader = {{'R', 'I', 'F', 'F'}, 0}; // Size will be updated later
+  currentVideoFile.write((uint8_t*)&riffHeader, sizeof(riffHeader));
+  currentVideoFile.write((const uint8_t*)"AVI ", 4);
+  
+  // LIST hdrl
+  ChunkHeader listHeader = {{'L', 'I', 'S', 'T'}, sizeof(AviMainHeader) + 8 + sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 4};
+  currentVideoFile.write((uint8_t*)&listHeader, sizeof(listHeader));
+  currentVideoFile.write((const uint8_t*)"hdrl", 4);
+  
+  // avih chunk
+  ChunkHeader avihChunk = {{'a', 'v', 'i', 'h'}, sizeof(AviMainHeader)};
+  currentVideoFile.write((uint8_t*)&avihChunk, sizeof(avihChunk));
+  
+  AviMainHeader mainHeader = {};
+  mainHeader.microSecPerFrame = 1000000 / FRAME_RATE;
+  mainHeader.maxBytesPerSec = 640 * 480 * FRAME_RATE / 4; // Estimate for JPEG
+  mainHeader.paddingGranularity = 0;
+  mainHeader.flags = 0x10; // AVIF_HASINDEX
+  mainHeader.totalFrames = 0; // Will update later
+  mainHeader.initialFrames = 0;
+  mainHeader.streams = 1;
+  mainHeader.suggestedBufferSize = 64000;
+  mainHeader.width = 640;
+  mainHeader.height = 480;
+  currentVideoFile.write((uint8_t*)&mainHeader, sizeof(mainHeader));
+  
+  // LIST strl
+  ChunkHeader strlHeader = {{'L', 'I', 'S', 'T'}, sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 4};
+  currentVideoFile.write((uint8_t*)&strlHeader, sizeof(strlHeader));
+  currentVideoFile.write((const uint8_t*)"strl", 4);
+  
+  // strh chunk
+  ChunkHeader strhChunk = {{'s', 't', 'r', 'h'}, sizeof(AviStreamHeader)};
+  currentVideoFile.write((uint8_t*)&strhChunk, sizeof(strhChunk));
+  
+  AviStreamHeader streamHeader = {};
+  memcpy(streamHeader.fccType, "vids", 4);
+  memcpy(streamHeader.fccHandler, "MJPG", 4);
+  streamHeader.flags = 0;
+  streamHeader.priority = 0;
+  streamHeader.language = 0;
+  streamHeader.initialFrames = 0;
+  streamHeader.scale = 1;
+  streamHeader.rate = FRAME_RATE;
+  streamHeader.start = 0;
+  streamHeader.length = 0; // Will update later
+  streamHeader.suggestedBufferSize = 64000;
+  streamHeader.quality = (uint32_t)-1;
+  streamHeader.sampleSize = 0;
+  streamHeader.frame.left = 0;
+  streamHeader.frame.top = 0;
+  streamHeader.frame.right = 640;
+  streamHeader.frame.bottom = 480;
+  currentVideoFile.write((uint8_t*)&streamHeader, sizeof(streamHeader));
+  
+  // strf chunk (stream format)
+  ChunkHeader strfChunk = {{'s', 't', 'r', 'f'}, sizeof(BitmapInfoHeader)};
+  currentVideoFile.write((uint8_t*)&strfChunk, sizeof(strfChunk));
+  
+  BitmapInfoHeader bitmapHeader = {};
+  bitmapHeader.size = sizeof(BitmapInfoHeader);
+  bitmapHeader.width = 640;
+  bitmapHeader.height = 480;
+  bitmapHeader.planes = 1;
+  bitmapHeader.bitCount = 24;
+  bitmapHeader.compression = 0x47504A4D; // 'MJPG' in little endian
+  bitmapHeader.sizeImage = 640 * 480 * 3;
+  bitmapHeader.xPelsPerMeter = 0;
+  bitmapHeader.yPelsPerMeter = 0;
+  bitmapHeader.clrUsed = 0;
+  bitmapHeader.clrImportant = 0;
+  currentVideoFile.write((uint8_t*)&bitmapHeader, sizeof(bitmapHeader));
+  
+  // LIST movi
+  moviListPos = currentVideoFile.position();
+  ChunkHeader moviHeader = {{'L', 'I', 'S', 'T'}, 4}; // Size will be updated later
+  currentVideoFile.write((uint8_t*)&moviHeader, sizeof(moviHeader));
+  currentVideoFile.write((const uint8_t*)"movi", 4);
+  
+  currentFileFrames = 0;
+  totalDataSize = 0;
+  
+  Serial.println("AVI header written successfully");
+}
+
+void updateAviHeader() {
+  if (!currentVideoFile || currentFileFrames == 0) return;
+  
+  uint32_t currentPos = currentVideoFile.position();
+  
+  // Update RIFF size
+  uint32_t riffSize = currentPos - 8;
+  currentVideoFile.seek(4);
+  currentVideoFile.write((uint8_t*)&riffSize, 4);
+  
+  // Update total frames in main header
+  currentVideoFile.seek(32); // Position of totalFrames in AviMainHeader
+  currentVideoFile.write((uint8_t*)&currentFileFrames, 4);
+  
+  // Update stream length
+  currentVideoFile.seek(84); // Position of length in AviStreamHeader
+  currentVideoFile.write((uint8_t*)&currentFileFrames, 4);
+  
+  // Update movi list size
+  uint32_t moviSize = currentPos - moviListPos - 8;
+  currentVideoFile.seek(moviListPos + 4);
+  currentVideoFile.write((uint8_t*)&moviSize, 4);
+  
+  // Go back to end of file
+  currentVideoFile.seek(currentPos);
+  
+  Serial.printf("Updated AVI header: %lu frames, %lu bytes\n", currentFileFrames, riffSize);
 }
 
 void rotateVideoFile() {
   if (currentVideoFile) {
-    currentVideoFile.print("\r\n--video--\r\n");
+    updateAviHeader();
     currentVideoFile.close();
-    Serial.printf("Completed video file %d, duration: %lu ms\n", 
-                 fileCounter, millis() - videoStartTime);
+    Serial.printf("Completed AVI file %d, frames: %lu, size: %lu bytes\n", 
+                 fileCounter, currentFileFrames, totalDataSize);
   }
 
   if (SD_MMC.totalBytes() - SD_MMC.usedBytes() < FREE_SPACE_MIN) {
@@ -177,13 +349,13 @@ void rotateVideoFile() {
   currentVideoFile = SD_MMC.open(filename.c_str(), FILE_WRITE);
   
   if (currentVideoFile) {
-    currentVideoFile.print("--video\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n");
-    Serial.printf("Started new video file: %s\n", filename.c_str());
+    Serial.printf("Started new AVI file: %s\n", filename.c_str());
+    writeAviHeader();
     videoStartTime = millis();
     frameCounter = 0;
     fileCounter++;
   } else {
-    Serial.println("Failed to create new file!");
+    Serial.println("Failed to create new AVI file!");
   }
 }
 
@@ -197,8 +369,8 @@ void deleteOldestFile() {
   File file = root.openNextFile();
   while (file) {
     String fname = String(file.name());
-    if (fname.startsWith("/Dashcam_") && fname.endsWith(".mjpeg")) {
-      unsigned long num = fname.substring(9, fname.length() - 6).toInt();
+    if (fname.startsWith("/Dashcam_") && fname.endsWith(".avi")) {
+      unsigned long num = fname.substring(9, fname.length() - 4).toInt();
       if (num < oldestNum) {
         oldestNum = num;
         oldestFile = fname;
@@ -256,47 +428,68 @@ void restartRecording() {
 }
 
 void startRecording() {
-    if (!recordingStarted) {
-        videoStartTime = millis();
-        frameCount = 0;
-        rotateVideoFile();
-        recordingStarted = true;
-        isFirstBoot = false;
-        Serial.println("Recording started automatically");
-    }
+    videoStartTime = millis();
+    frameCount = 0;
+    rotateVideoFile();
+    recordingStarted = true;
+    isFirstBoot = false;
+    Serial.println("Recording started automatically");
+}
+
+void completeVideoFile() {
+  if (currentVideoFile) {
+    updateAviHeader();
+    currentVideoFile.close();
+    Serial.printf("Completed video file: Dashcam_%d.avi\n", fileCounter-1);
+  }
 }
 
 void recordingTask(void* parameter) {
     esp_task_wdt_init(WDT_TIMEOUT, true);
     esp_task_wdt_add(NULL);
     
+    // Ensure recording starts immediately
+    Serial.println("Recording task started - initializing...");
+    delay(2000); // Give system time to stabilize
+    
     size_t frameErrors = 0;
     unsigned long videoStartUs = micros();
-    unsigned long nextFrameUs = videoStartUs;
+    unsigned long nextFrameUs = videoStartUs + FRAME_INTERVAL;
     
     while(true) {
-        unsigned long frameStartUs = micros();
+        unsigned long currentUs = micros();
         
-        // Check if it's time for next frame
-        if (frameStartUs < nextFrameUs) {
-            delayMicroseconds(nextFrameUs - frameStartUs);
+        // Wait until it's time for the next frame
+        if (currentUs < nextFrameUs) {
+            unsigned long waitUs = nextFrameUs - currentUs;
+            if (waitUs < 50000) { // Only delay if less than 50ms
+                delayMicroseconds(waitUs);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(waitUs / 1000)); // Use vTaskDelay for longer waits
+            }
+            esp_task_wdt_reset();
             continue;
         }
         
         if (!currentVideoFile || !recordingStarted) {
+            Serial.println("Starting new recording cycle...");
             startRecording();
             videoStartUs = micros();
-            nextFrameUs = videoStartUs;
+            nextFrameUs = videoStartUs + FRAME_INTERVAL;
             esp_task_wdt_reset();
             continue;
         }
 
         camera_fb_t* fb = esp_camera_fb_get();
         if (!fb) {
+            Serial.println("Camera capture failed");
             if (++frameErrors > 5) {
+                Serial.println("Too many camera errors, restarting...");
                 ESP.restart();
             }
-            nextFrameUs = micros() + FRAME_INTERVAL;
+            // Still advance to next frame time even on error
+            nextFrameUs += FRAME_INTERVAL;
+            esp_task_wdt_reset();
             continue;
         }
         frameErrors = 0;
@@ -304,43 +497,72 @@ void recordingTask(void* parameter) {
         if (currentVideoFile && writeBuffer) {
             bool writeOK = true;
             
-            // Write frame with timestamp
-            currentVideoFile.printf("--frame\r\nContent-Type: image/jpeg\r\nX-Timestamp: %lu\r\nContent-Length: %u\r\n\r\n", 
-                                  (micros() - videoStartUs), fb->len);
+            // Write AVI chunk header for frame
+            ChunkHeader frameChunk = {{'0', '0', 'd', 'c'}, fb->len};
             
-            // Write frame data
-            size_t pos = 0;
-            while (pos < fb->len && writeOK) {
-                size_t toWrite = minSize(writeBufferSize, fb->len - pos);
-                if (currentVideoFile.write(fb->buf + pos, toWrite) != toWrite) {
-                    writeOK = false;
-                    break;
+            if (currentVideoFile.write((uint8_t*)&frameChunk, sizeof(frameChunk)) != sizeof(frameChunk)) {
+                writeOK = false;
+                Serial.println("Failed to write frame header");
+            }
+            
+            // Write frame data in chunks
+            if (writeOK) {
+                size_t pos = 0;
+                while (pos < fb->len && writeOK) {
+                    size_t toWrite = minSize(writeBufferSize, fb->len - pos);
+                    if (currentVideoFile.write(fb->buf + pos, toWrite) != toWrite) {
+                        writeOK = false;
+                        Serial.println("Frame write failed");
+                        break;
+                    }
+                    pos += toWrite;
+                    if (pos % (writeBufferSize * 4) == 0) {
+                        esp_task_wdt_reset();
+                    }
                 }
-                pos += toWrite;
-                if (pos % (writeBufferSize * 4) == 0) {
-                    esp_task_wdt_reset();
-                }
+            }
+            
+            // Add padding if frame size is odd (AVI requirement)
+            if (writeOK && (fb->len % 2) == 1) {
+                uint8_t padding = 0;
+                currentVideoFile.write(&padding, 1);
             }
             
             if (writeOK) {
-                currentVideoFile.print("\r\n");
+                currentVideoFile.flush(); // Ensure data is written
                 frameCount++;
+                currentFileFrames++;
+                totalDataSize += sizeof(ChunkHeader) + fb->len + (fb->len % 2);
                 lastFrameSuccess = millis();
+                
+                // Debug output every 100 frames
+                if (frameCount % 100 == 0) {
+                    Serial.printf("Recorded %lu frames, file frames: %lu, data size: %lu, frame size: %u\n", 
+                                frameCount, currentFileFrames, totalDataSize, fb->len);
+                }
                 
                 // Rotate file after exactly FRAMES_PER_VIDEO frames
                 if (frameCount >= FRAMES_PER_VIDEO) {
-                    completeVideoFile();
-                    rotateVideoFile();
+                    Serial.printf("Completing 1-minute AVI with %lu frames\n", frameCount);
+                    rotateVideoFile();  // This will start a new file automatically
                     videoStartUs = micros();
                     frameCount = 0;
+                    nextFrameUs = videoStartUs + FRAME_INTERVAL;
+                } else {
+                    // Calculate next frame time based on start time and frame count
+                    nextFrameUs = videoStartUs + (frameCount + 1) * FRAME_INTERVAL;
                 }
+            } else {
+                failedWrites++;
+                // Even on write failure, advance to next frame time
+                nextFrameUs += FRAME_INTERVAL;
             }
+        } else {
+            Serial.println("No file handle or write buffer");
+            nextFrameUs += FRAME_INTERVAL;
         }
 
         esp_camera_fb_return(fb);
-        
-        // Calculate next frame time
-        nextFrameUs = videoStartUs + (frameCount + 1) * FRAME_INTERVAL;
         esp_task_wdt_reset();
     }
 }
@@ -405,6 +627,12 @@ void setup() {
     return;
   }
 
+  Serial.printf("SD Card Type: %s\n", 
+    SD_MMC.cardType() == CARD_MMC ? "MMC" :
+    SD_MMC.cardType() == CARD_SD ? "SDSC" :
+    SD_MMC.cardType() == CARD_SDHC ? "SDHC" : "UNKNOWN");
+  Serial.printf("SD Card Size: %lluMB\n", SD_MMC.cardSize() / (1024 * 1024));
+
   startCamera();
   initMemory();
   
@@ -419,8 +647,8 @@ void setup() {
     RECORDING_CORE
   );
   
-  // Ensure recording starts immediately
-  startRecording();
+  Serial.println("ESP32-CAM ready - continuous recording will start automatically");
+  Serial.printf("Recording %d frames per minute at %dfps\n", FRAMES_PER_VIDEO, FRAME_RATE);
   
   // Serve UI
   asyncServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -682,6 +910,7 @@ void setup() {
         'json': '📋',  // Data files
         'csv': '📊',   // Spreadsheet files
         'avi': '🎥',   // Video files
+        'mjpeg': '📹', // Video files
         'default': '📁' // Default icon
       };
       return icons[ext] || icons.default;
@@ -790,18 +1019,27 @@ void setup() {
   });
 
   asyncServer.begin();
-  
-  // Remove sync server for streaming
-  // Start recording immediately
-  startRecording();
+  Serial.println("Web server started");
 }
 
 void loop() {
-  // Check recording status
-  if (!recordingStarted) {
-    startRecording();
+  // Monitor system health
+  monitorSystem();
+  
+  // Check if recording task is still running
+  if (recordingTaskHandle == NULL || eTaskGetState(recordingTaskHandle) == eDeleted) {
+    Serial.println("Recording task stopped, restarting...");
+    xTaskCreatePinnedToCore(
+      recordingTask,
+      "Record",
+      STACK_SIZE,
+      NULL,
+      2,
+      &recordingTaskHandle,
+      RECORDING_CORE
+    );
   }
   
   esp_task_wdt_reset();
-  vTaskDelay(pdMS_TO_TICKS(100));
+  vTaskDelay(pdMS_TO_TICKS(1000)); // Check every second
 }
