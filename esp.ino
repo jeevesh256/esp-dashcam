@@ -54,9 +54,9 @@ struct StorageInfo {
 #define RECOVERY_DELAY 1000       // Delay between recovery attempts
 #define FREE_SPACE_MIN 5242880    // 5MB minimum free space
 #define VIDEO_DURATION 60000     // 60 seconds
-#define FRAME_RATE 15            // 15fps constant
-#define FRAME_INTERVAL 66666     // Microseconds (1000000/15 for 15fps)
-#define FRAMES_PER_VIDEO 900     // Total frames for 1 minute (15fps * 60s)
+#define FRAME_RATE 5             // Reduced to 5fps for smaller files with better quality
+#define FRAME_INTERVAL 200000    // Microseconds (1000000/5 for 5fps)
+#define FRAMES_PER_VIDEO 300     // Total frames for 1 minute (5fps * 60s)
 #define WRITE_BUFFER_SIZE 512    // Smaller write buffer
 #define FRAME_BUFFER_SIZE 8192   // Smaller frame buffer
 #define STACK_SIZE 4096          // Reduced stack size
@@ -125,12 +125,12 @@ void startCamera() {
     config.pin_sscb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 10000000; // Lower clock speed
+    config.xclk_freq_hz = 20000000; // Higher clock for better quality
     config.pixel_format = PIXFORMAT_JPEG;
 
-    config.frame_size = FRAMESIZE_VGA;
-    config.jpeg_quality = 20;        // Lower quality
-    config.fb_count = 1;            // Single buffer
+    config.frame_size = FRAMESIZE_VGA;   // VGA (640x480) for good balance
+    config.jpeg_quality = 10;            // Much better quality (10 instead of 18)
+    config.fb_count = 2;                 // Dual buffer for stability
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
     
@@ -141,11 +141,35 @@ void startCamera() {
     }
     
     sensor_t* s = esp_camera_sensor_get();
-    s->set_framesize(s, FRAMESIZE_VGA);
-    s->set_quality(s, 20);
-    s->set_brightness(s, 0);
-    s->set_saturation(s, -2);    // Reduce color data
-    s->set_contrast(s, -2);      // Reduce contrast
+    s->set_framesize(s, FRAMESIZE_VGA);   // 640x480 resolution
+    s->set_quality(s, 10);                // Better quality for less artifacts
+    s->set_brightness(s, 0);              // Neutral brightness
+    s->set_saturation(s, 0);              // Normal saturation (no reduction)
+    s->set_contrast(s, 0);                // Normal contrast (no reduction)
+    s->set_sharpness(s, 0);               // Normal sharpness
+    s->set_denoise(s, 1);                 // Enable denoise
+    s->set_gainceiling(s, GAINCEILING_2X); // Lower gain ceiling for less noise
+    s->set_colorbar(s, 0);                // Disable color bar
+    s->set_whitebal(s, 1);                // Enable white balance
+    s->set_gain_ctrl(s, 1);               // Enable gain control
+    s->set_exposure_ctrl(s, 1);           // Enable exposure control
+    s->set_hmirror(s, 0);                 // No horizontal mirror
+    s->set_vflip(s, 0);                   // No vertical flip
+    s->set_awb_gain(s, 1);                // Enable auto white balance gain
+    s->set_agc_gain(s, 0);                // Auto gain control
+    s->set_aec_value(s, 300);             // Auto exposure value
+    s->set_aec2(s, 0);                    // Disable AEC2
+    s->set_dcw(s, 1);                     // Enable downsize
+    s->set_bpc(s, 0);                     // Disable bad pixel correction
+    s->set_wpc(s, 1);                     // Enable white pixel correction
+    s->set_raw_gma(s, 1);                 // Enable gamma correction
+    s->set_lenc(s, 1);                    // Enable lens correction
+    
+    // Additional fixes for color artifacts
+    s->set_special_effect(s, 0);          // No special effects
+    s->set_wb_mode(s, 0);                 // Auto white balance mode
+    
+    Serial.println("Camera configured for 5fps with high quality (target: ~4MB)");
 }
 
 // Add AVI header structures
@@ -223,8 +247,9 @@ void writeAviHeader() {
   currentVideoFile.write((uint8_t*)&riffHeader, sizeof(riffHeader));
   currentVideoFile.write((const uint8_t*)"AVI ", 4);
   
-  // LIST hdrl
-  ChunkHeader listHeader = {{'L', 'I', 'S', 'T'}, sizeof(AviMainHeader) + 8 + sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 4};
+  // LIST hdrl - Fixed size calculation
+  uint32_t hdrlSize = 4 + sizeof(AviMainHeader) + 8 + 4 + sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 8;
+  ChunkHeader listHeader = {{'L', 'I', 'S', 'T'}, hdrlSize};
   currentVideoFile.write((uint8_t*)&listHeader, sizeof(listHeader));
   currentVideoFile.write((const uint8_t*)"hdrl", 4);
   
@@ -234,19 +259,21 @@ void writeAviHeader() {
   
   AviMainHeader mainHeader = {};
   mainHeader.microSecPerFrame = 1000000 / FRAME_RATE;
-  mainHeader.maxBytesPerSec = 640 * 480 * FRAME_RATE / 4; // Estimate for JPEG
+  mainHeader.maxBytesPerSec = 640 * 480 * FRAME_RATE / 3; // Adjusted for better quality
   mainHeader.paddingGranularity = 0;
   mainHeader.flags = 0x10; // AVIF_HASINDEX
   mainHeader.totalFrames = 0; // Will update later
   mainHeader.initialFrames = 0;
   mainHeader.streams = 1;
-  mainHeader.suggestedBufferSize = 64000;
-  mainHeader.width = 640;
-  mainHeader.height = 480;
+  mainHeader.suggestedBufferSize = 100000; // Increased for better quality
+  mainHeader.width = 640;    // VGA width
+  mainHeader.height = 480;   // VGA height
+  memset(mainHeader.reserved, 0, sizeof(mainHeader.reserved)); // Clear reserved fields
   currentVideoFile.write((uint8_t*)&mainHeader, sizeof(mainHeader));
   
-  // LIST strl
-  ChunkHeader strlHeader = {{'L', 'I', 'S', 'T'}, sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 4};
+  // LIST strl - Fixed size calculation
+  uint32_t strlSize = 4 + sizeof(AviStreamHeader) + 8 + sizeof(BitmapInfoHeader) + 8;
+  ChunkHeader strlHeader = {{'L', 'I', 'S', 'T'}, strlSize};
   currentVideoFile.write((uint8_t*)&strlHeader, sizeof(strlHeader));
   currentVideoFile.write((const uint8_t*)"strl", 4);
   
@@ -265,13 +292,13 @@ void writeAviHeader() {
   streamHeader.rate = FRAME_RATE;
   streamHeader.start = 0;
   streamHeader.length = 0; // Will update later
-  streamHeader.suggestedBufferSize = 64000;
-  streamHeader.quality = (uint32_t)-1;
+  streamHeader.suggestedBufferSize = 100000; // Increased for better quality
+  streamHeader.quality = 10000; // Better quality setting (not -1)
   streamHeader.sampleSize = 0;
   streamHeader.frame.left = 0;
   streamHeader.frame.top = 0;
-  streamHeader.frame.right = 640;
-  streamHeader.frame.bottom = 480;
+  streamHeader.frame.right = 640;  // VGA width
+  streamHeader.frame.bottom = 480; // VGA height
   currentVideoFile.write((uint8_t*)&streamHeader, sizeof(streamHeader));
   
   // strf chunk (stream format)
@@ -280,12 +307,12 @@ void writeAviHeader() {
   
   BitmapInfoHeader bitmapHeader = {};
   bitmapHeader.size = sizeof(BitmapInfoHeader);
-  bitmapHeader.width = 640;
-  bitmapHeader.height = 480;
+  bitmapHeader.width = 640;   // VGA width
+  bitmapHeader.height = 480;  // VGA height
   bitmapHeader.planes = 1;
   bitmapHeader.bitCount = 24;
   bitmapHeader.compression = 0x47504A4D; // 'MJPG' in little endian
-  bitmapHeader.sizeImage = 640 * 480 * 3;
+  bitmapHeader.sizeImage = 640 * 480 * 3; // VGA size
   bitmapHeader.xPelsPerMeter = 0;
   bitmapHeader.yPelsPerMeter = 0;
   bitmapHeader.clrUsed = 0;
@@ -301,7 +328,7 @@ void writeAviHeader() {
   currentFileFrames = 0;
   totalDataSize = 0;
   
-  Serial.println("AVI header written successfully");
+  Serial.println("AVI header written successfully with improved format");
 }
 
 void updateAviHeader() {
@@ -648,7 +675,7 @@ void setup() {
   );
   
   Serial.println("ESP32-CAM ready - continuous recording will start automatically");
-  Serial.printf("Recording %d frames per minute at %dfps\n", FRAMES_PER_VIDEO, FRAME_RATE);
+  Serial.printf("Recording %d frames per minute at %dfps (VGA 640x480, high quality, target: ~4MB)\n", FRAMES_PER_VIDEO, FRAME_RATE);
   
   // Serve UI
   asyncServer.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
